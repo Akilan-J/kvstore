@@ -27,15 +27,17 @@ public final class PeerServer {
 
     private final int port;
     private final int poolSize;
+    private final RaftNode raftNode;
 
     private ServerSocket serverSocket;
     private ExecutorService pool;
     private Thread acceptThread;
     private volatile boolean running;
 
-    public PeerServer(int port, int poolSize) {
+    public PeerServer(int port, int poolSize, RaftNode raftNode) {
         this.port = port;
         this.poolSize = poolSize;
+        this.raftNode = raftNode;
     }
 
     public void start() throws IOException {
@@ -60,7 +62,7 @@ public final class PeerServer {
             try {
                 Socket peer = serverSocket.accept();
                 try {
-                    pool.execute(new PeerConnectionHandler(peer));
+                    pool.execute(new PeerConnectionHandler(peer, raftNode));
                 } catch (RejectedExecutionException e) {
                     peer.close(); // shutting down
                 }

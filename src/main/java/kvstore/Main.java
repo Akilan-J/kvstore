@@ -4,11 +4,13 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 import kvstore.raft.ClusterConfig;
 import kvstore.raft.PeerClient;
 import kvstore.raft.PeerServer;
+import kvstore.raft.RaftNode;
 import kvstore.server.KVServer;
 import kvstore.store.KeyValueStore;
 import kvstore.wal.WriteAheadLog;
@@ -64,23 +66,37 @@ public final class Main {
         server.start();
 
         PeerServer peerServer = null;
+        RaftNode raftNode = null;
         if (raftId != null) {
             if (raftPort < 0) {
                 raftPort = port + 1000; // keeps client and peer ports from colliding by default
             }
             ClusterConfig cluster = ClusterConfig.parse(raftId, peersArg);
+
+            Map<Integer, PeerClient> peerClients = new LinkedHashMap<>();
+            for (Map.Entry<Integer, InetSocketAddress> e : cluster.peers().entrySet()) {
+                // Timeout well under the minimum election timeout, so one slow or dead
+                // peer can't stall the loop that's supposed to be detecting it as dead.
+                peerClients.put(e.getKey(), new PeerClient(e.getValue(), 100));
+            }
+
+            raftNode = new RaftNode(raftId, cluster, peerClients);
             // At least 1: newFixedThreadPool(0) would accept connections and then
             // never service them, since no thread exists to run the handlers.
-            peerServer = new PeerServer(raftPort, Math.max(1, cluster.peers().size()));
+            peerServer = new PeerServer(raftPort, Math.max(1, cluster.peers().size()), raftNode);
             peerServer.start();
-            System.out.printf("raft peer listener on port=%d id=%d cluster_size=%d%n",
-                    peerServer.port(), raftId, cluster.clusterSize());
-            probePeers(cluster);
+            raftNode.start();
+            System.out.printf("raft node id=%d cluster_size=%d peer_port=%d%n",
+                    raftId, cluster.clusterSize(), peerServer.port());
         }
 
         PeerServer finalPeerServer = peerServer;
+        RaftNode finalRaftNode = raftNode;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             server.stop();
+            if (finalRaftNode != null) {
+                finalRaftNode.stop();
+            }
             if (finalPeerServer != null) {
                 finalPeerServer.stop();
             }
@@ -96,25 +112,6 @@ public final class Main {
         System.out.flush();
 
         server.awaitTermination();
-    }
-
-    /**
-     * One-shot connectivity check at startup: PING every configured peer and log
-     * whether it answered. This is not Raft yet — there's no term or vote state,
-     * PING just proves the peer RPC channel works end to end before election
-     * logic gets built on top of it. A peer that isn't up yet is expected (nodes
-     * start independently) and not fatal; retry behaviour arrives with elections.
-     */
-    private static void probePeers(ClusterConfig cluster) {
-        for (Map.Entry<Integer, InetSocketAddress> entry : cluster.peers().entrySet()) {
-            try (PeerClient client = new PeerClient(entry.getValue(), 1000)) {
-                client.ping(0);
-                System.out.printf("peer %d at %s: reachable%n", entry.getKey(), entry.getValue());
-            } catch (IOException e) {
-                System.out.printf("peer %d at %s: unreachable (%s)%n",
-                        entry.getKey(), entry.getValue(), e.getMessage());
-            }
-        }
     }
 
     private static void printUsage() {

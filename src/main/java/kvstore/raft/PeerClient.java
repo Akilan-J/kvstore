@@ -35,22 +35,44 @@ public final class PeerClient implements Closeable {
         this.timeoutMillis = timeoutMillis;
     }
 
-    /** Sends PING and returns the echoed term, or throws if the peer is unreachable. */
-    public long ping(long term) throws IOException {
+    /** Asks this peer for its vote in {@code term}. */
+    public RaftRpc.VoteReply requestVote(long term, int candidateId) throws IOException {
         ensureConnected();
         try {
-            out.write(("PING " + term + "\r\n").getBytes(StandardCharsets.UTF_8));
+            out.write(("REQUEST_VOTE " + term + " " + candidateId + "\r\n").getBytes(StandardCharsets.UTF_8));
             out.flush();
             String reply = in.readLine();
             if (reply == null) {
-                throw new IOException("peer closed connection during PING");
+                throw new IOException("peer closed connection during REQUEST_VOTE");
             }
-            if (!reply.startsWith("PONG ")) {
-                throw new IOException("unexpected PING reply: " + reply);
+            String[] parts = reply.split(" ");
+            if (parts.length != 3 || !parts[0].equals("VOTE")) {
+                throw new IOException("unexpected REQUEST_VOTE reply: " + reply);
             }
-            return Long.parseLong(reply.substring(5));
+            return new RaftRpc.VoteReply(Long.parseLong(parts[1]), "1".equals(parts[2]));
         } catch (IOException | NumberFormatException e) {
             closeQuietly(); // drop the bad socket so the next call reconnects from scratch
+            throw (e instanceof IOException io) ? io : new IOException(e);
+        }
+    }
+
+    /** Sends a heartbeat (log-entry-free AppendEntries) and returns the peer's current term. */
+    public long appendEntries(long term, int leaderId) throws IOException {
+        ensureConnected();
+        try {
+            out.write(("APPEND_ENTRIES " + term + " " + leaderId + "\r\n").getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            String reply = in.readLine();
+            if (reply == null) {
+                throw new IOException("peer closed connection during APPEND_ENTRIES");
+            }
+            String[] parts = reply.split(" ");
+            if (parts.length != 2 || !parts[0].equals("APPEND_REPLY")) {
+                throw new IOException("unexpected APPEND_ENTRIES reply: " + reply);
+            }
+            return Long.parseLong(parts[1]);
+        } catch (IOException | NumberFormatException e) {
+            closeQuietly();
             throw (e instanceof IOException io) ? io : new IOException(e);
         }
     }
