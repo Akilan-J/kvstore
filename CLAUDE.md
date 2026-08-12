@@ -70,10 +70,15 @@ fsync 15,460 ops/sec; read 25,815 ops/sec; mixed 17,604 ops/sec. **Re-run these
 locally and update the README** — the 4× fsync gap is the headline result and the
 best interview talking point in the project.
 
-## Stage 2: Raft replication (next)
+## Stage 2: Raft replication (in progress)
 
-- [ ] Static 3-node membership, peer RPC channel
-- [ ] Leader election: terms, `RequestVote`, randomised election timeouts
+- [x] Static 3-node membership, peer RPC channel — `kvstore.raft`:
+      `ClusterConfig`, `PeerServer`/`PeerConnectionHandler`, `PeerClient`.
+      Separate port from the client protocol; gated behind `--id` so
+      stage-1 single-node mode is unchanged when it's omitted.
+- [x] Leader election: terms, `RequestVote`, randomised election timeouts —
+      `RaftNode`. Verified on a 3-node cluster: clean initial election, and
+      re-election after SIGKILLing the leader mid-run, no split-brain.
 - [ ] Log replication: `AppendEntries`, commit index
 - [ ] Leader-only reads, writes acknowledged after quorum
 - [ ] Chaos test: kill the leader mid-write, assert new leader elected and no
