@@ -36,10 +36,17 @@ import kvstore.store.KeyValueStore;
  *
  * <p>When Raft is enabled ({@code raftNode != null}), PUT and DEL are submitted
  * to the log and don't reply OK until a majority has committed them — this is
- * what "writes acknowledged after quorum" means in practice. GET still reads
- * straight from this node's local store regardless of role, which can be
- * stale on a follower; restricting reads to the leader is deliberately not
- * done yet (see CLAUDE.md's stage-2 checklist).
+ * what "writes acknowledged after quorum" means in practice. GET is rejected
+ * unless this node currently believes itself to be leader, which stops a
+ * follower from ever answering with stale data.
+ *
+ * <p><b>Known gap:</b> "believes itself to be leader" is just this node's own
+ * {@code role}, not a fresh confirmation that it can still reach a majority
+ * right now. A leader cut off by a network partition can go on thinking it's
+ * leader — and serving reads on that belief — for up to one election timeout
+ * after the rest of the cluster has already elected someone else. Real Raft
+ * closes this with a "read index" (confirm leadership via one heartbeat round
+ * before answering) or leader leases; neither is implemented here.
  */
 final class ConnectionHandler implements Runnable {
 
@@ -107,6 +114,10 @@ final class ConnectionHandler implements Runnable {
     private void handleGet(String[] parts, OutputStream out) throws IOException {
         if (parts.length != 2) {
             writeError(out, "usage: GET <key>");
+            return;
+        }
+        if (raftNode != null && raftNode.role() != RaftNode.Role.LEADER) {
+            writeError(out, "not leader (" + leaderHint() + ")");
             return;
         }
         byte[] value = store.get(parts[1]);
@@ -197,12 +208,15 @@ final class ConnectionHandler implements Runnable {
             return false;
         }
         if (!committed) {
-            Integer leader = raftNode.leaderId();
-            String hint = (leader == null) ? "no known leader" : "leader is node " + leader;
-            writeError(out, "not leader, or write did not commit in time (" + hint + ")");
+            writeError(out, "not leader, or write did not commit in time (" + leaderHint() + ")");
             return false;
         }
         return true;
+    }
+
+    private String leaderHint() {
+        Integer leader = raftNode.leaderId();
+        return (leader == null) ? "no known leader" : "leader is node " + leader;
     }
 
     @FunctionalInterface
