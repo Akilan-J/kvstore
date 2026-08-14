@@ -10,6 +10,7 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 
 import kvstore.net.ProtocolReader;
+import kvstore.raft.RaftNode;
 import kvstore.store.KeyValueStore;
 
 /**
@@ -32,18 +33,32 @@ import kvstore.store.KeyValueStore;
  *
  * <p>The shape is deliberately close to Redis's RESP so the framing is familiar,
  * but it is not wire-compatible.
+ *
+ * <p>When Raft is enabled ({@code raftNode != null}), PUT and DEL are submitted
+ * to the log and don't reply OK until a majority has committed them — this is
+ * what "writes acknowledged after quorum" means in practice. GET still reads
+ * straight from this node's local store regardless of role, which can be
+ * stale on a follower; restricting reads to the leader is deliberately not
+ * done yet (see CLAUDE.md's stage-2 checklist).
  */
 final class ConnectionHandler implements Runnable {
 
     private static final int MAX_VALUE_BYTES = 16 * 1024 * 1024;
     private static final int MAX_KEY_CHARS = 1024;
 
+    // Comfortably above one election timeout's worth of retries, so a write
+    // submitted just as the leader dies still has a chance to land on the node
+    // that wins the next election, without leaving a client hanging forever.
+    private static final long COMMIT_TIMEOUT_MILLIS = 2000;
+
     private final Socket socket;
     private final KeyValueStore store;
+    private final RaftNode raftNode; // null in stage-1 single-node mode
 
-    ConnectionHandler(Socket socket, KeyValueStore store) {
+    ConnectionHandler(Socket socket, KeyValueStore store, RaftNode raftNode) {
         this.socket = socket;
         this.store = store;
+        this.raftNode = raftNode;
     }
 
     @Override
@@ -133,6 +148,13 @@ final class ConnectionHandler implements Runnable {
 
         byte[] value = in.readExactly(length);
         in.consumeTerminator();
+
+        if (raftNode != null) {
+            if (awaitCommit(out, () -> raftNode.submitPut(key, value, COMMIT_TIMEOUT_MILLIS))) {
+                writeSimple(out, "OK");
+            }
+            return;
+        }
         store.put(key, value);
         writeSimple(out, "OK");
     }
@@ -142,9 +164,50 @@ final class ConnectionHandler implements Runnable {
             writeError(out, "usage: DEL <key>");
             return;
         }
-        boolean removed = store.delete(parts[1]);
+        String key = parts[1];
+
+        if (raftNode != null) {
+            if (awaitCommit(out, () -> raftNode.submitDelete(key, COMMIT_TIMEOUT_MILLIS))) {
+                // Known simplification: a replicated delete always reports "removed"
+                // once committed. Whether the key actually existed at that point in
+                // the log isn't threaded back from the apply loop, unlike the direct
+                // (non-Raft) path below, which reports it exactly.
+                out.write(":1\r\n".getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+            }
+            return;
+        }
+        boolean removed = store.delete(key);
         out.write((removed ? ":1\r\n" : ":0\r\n").getBytes(StandardCharsets.US_ASCII));
         out.flush();
+    }
+
+    /**
+     * Submits a Raft write and waits for it to commit, writing an error reply and
+     * returning false if it doesn't; the caller writes the success reply itself
+     * since PUT and DEL report success differently.
+     */
+    private boolean awaitCommit(OutputStream out, RaftWrite write) throws IOException {
+        boolean committed;
+        try {
+            committed = write.run();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            writeError(out, "interrupted while waiting for commit");
+            return false;
+        }
+        if (!committed) {
+            Integer leader = raftNode.leaderId();
+            String hint = (leader == null) ? "no known leader" : "leader is node " + leader;
+            writeError(out, "not leader, or write did not commit in time (" + hint + ")");
+            return false;
+        }
+        return true;
+    }
+
+    @FunctionalInterface
+    private interface RaftWrite {
+        boolean run() throws InterruptedException;
     }
 
     private static void writeSimple(OutputStream out, String message) throws IOException {

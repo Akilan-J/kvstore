@@ -62,16 +62,13 @@ public final class Main {
                 "recovered %d records into %d keys in %.1f ms from %s%n",
                 replayed, store.size(), elapsedMillis, wal.path());
 
-        KVServer server = new KVServer(port, threads, store);
-        server.start();
-
-        PeerServer peerServer = null;
         RaftNode raftNode = null;
+        ClusterConfig cluster = null;
         if (raftId != null) {
             if (raftPort < 0) {
                 raftPort = port + 1000; // keeps client and peer ports from colliding by default
             }
-            ClusterConfig cluster = ClusterConfig.parse(raftId, peersArg);
+            cluster = ClusterConfig.parse(raftId, peersArg);
 
             Map<Integer, PeerClient> peerClients = new LinkedHashMap<>();
             for (Map.Entry<Integer, InetSocketAddress> e : cluster.peers().entrySet()) {
@@ -79,8 +76,17 @@ public final class Main {
                 // peer can't stall the loop that's supposed to be detecting it as dead.
                 peerClients.put(e.getKey(), new PeerClient(e.getValue(), 100));
             }
+            raftNode = new RaftNode(raftId, cluster, peerClients, store);
+        }
 
-            raftNode = new RaftNode(raftId, cluster, peerClients);
+        // KVServer needs raftNode (possibly null) at construction, so it's built
+        // after RaftNode exists but before RaftNode/PeerServer actually start —
+        // client connections won't arrive before this method returns anyway.
+        KVServer server = new KVServer(port, threads, store, raftNode);
+        server.start();
+
+        PeerServer peerServer = null;
+        if (raftId != null) {
             // At least 1: newFixedThreadPool(0) would accept connections and then
             // never service them, since no thread exists to run the handlers.
             peerServer = new PeerServer(raftPort, Math.max(1, cluster.peers().size()), raftNode);
