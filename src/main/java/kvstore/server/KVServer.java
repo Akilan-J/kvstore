@@ -10,6 +10,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import kvstore.raft.RaftNode;
 import kvstore.store.KeyValueStore;
 
 /**
@@ -25,16 +26,18 @@ public final class KVServer {
     private final int port;
     private final int poolSize;
     private final KeyValueStore store;
+    private final RaftNode raftNode; // null in stage-1 single-node mode
 
     private ServerSocket serverSocket;
     private ExecutorService pool;
     private Thread acceptThread;
     private volatile boolean running;
 
-    public KVServer(int port, int poolSize, KeyValueStore store) {
+    public KVServer(int port, int poolSize, KeyValueStore store, RaftNode raftNode) {
         this.port = port;
         this.poolSize = poolSize;
         this.store = store;
+        this.raftNode = raftNode;
     }
 
     /** Binds the listen socket and starts accepting in a background thread. */
@@ -60,7 +63,7 @@ public final class KVServer {
             try {
                 Socket client = serverSocket.accept();
                 try {
-                    pool.execute(new ConnectionHandler(client, store));
+                    pool.execute(new ConnectionHandler(client, store, raftNode));
                 } catch (RejectedExecutionException e) {
                     client.close(); // shutting down
                 }

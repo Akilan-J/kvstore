@@ -8,6 +8,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import kvstore.net.ProtocolReader;
 
@@ -35,11 +36,17 @@ public final class PeerClient implements Closeable {
         this.timeoutMillis = timeoutMillis;
     }
 
-    /** Asks this peer for its vote in {@code term}. */
-    public RaftRpc.VoteReply requestVote(long term, int candidateId) throws IOException {
+    /**
+     * Asks this peer for its vote in {@code term}. {@code lastLogIndex}/{@code lastLogTerm}
+     * describe our own log so the peer can refuse a candidate whose log is behind
+     * (Raft's election restriction — see {@link RaftNode#handleRequestVote}).
+     */
+    public RaftRpc.VoteReply requestVote(long term, int candidateId, int lastLogIndex, long lastLogTerm)
+            throws IOException {
         ensureConnected();
         try {
-            out.write(("REQUEST_VOTE " + term + " " + candidateId + "\r\n").getBytes(StandardCharsets.UTF_8));
+            out.write(("REQUEST_VOTE " + term + " " + candidateId + " " + lastLogIndex + " " + lastLogTerm + "\r\n")
+                    .getBytes(StandardCharsets.UTF_8));
             out.flush();
             String reply = in.readLine();
             if (reply == null) {
@@ -56,21 +63,37 @@ public final class PeerClient implements Closeable {
         }
     }
 
-    /** Sends a heartbeat (log-entry-free AppendEntries) and returns the peer's current term. */
-    public long appendEntries(long term, int leaderId) throws IOException {
+    /**
+     * Replicates {@code entries} (empty for a pure heartbeat) starting right after
+     * {@code prevLogIndex}/{@code prevLogTerm}, and tells the follower everything up
+     * to {@code leaderCommit} is safe to apply.
+     */
+    public RaftRpc.AppendReply appendEntries(long term, int leaderId, int prevLogIndex, long prevLogTerm,
+            List<RaftLog.Entry> entries, int leaderCommit) throws IOException {
         ensureConnected();
         try {
-            out.write(("APPEND_ENTRIES " + term + " " + leaderId + "\r\n").getBytes(StandardCharsets.UTF_8));
+            out.write((
+                    "APPEND_ENTRIES " + term + " " + leaderId + " " + prevLogIndex + " " + prevLogTerm
+                            + " " + leaderCommit + " " + entries.size() + "\r\n")
+                    .getBytes(StandardCharsets.UTF_8));
+            for (RaftLog.Entry entry : entries) {
+                byte[] command = entry.command();
+                out.write((entry.term() + " " + command.length + "\r\n").getBytes(StandardCharsets.UTF_8));
+                out.write(command);
+                out.write('\r');
+                out.write('\n');
+            }
             out.flush();
+
             String reply = in.readLine();
             if (reply == null) {
                 throw new IOException("peer closed connection during APPEND_ENTRIES");
             }
             String[] parts = reply.split(" ");
-            if (parts.length != 2 || !parts[0].equals("APPEND_REPLY")) {
+            if (parts.length != 3 || !parts[0].equals("APPEND_REPLY")) {
                 throw new IOException("unexpected APPEND_ENTRIES reply: " + reply);
             }
-            return Long.parseLong(parts[1]);
+            return new RaftRpc.AppendReply(Long.parseLong(parts[1]), "1".equals(parts[2]));
         } catch (IOException | NumberFormatException e) {
             closeQuietly();
             throw (e instanceof IOException io) ? io : new IOException(e);
