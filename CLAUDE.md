@@ -79,8 +79,18 @@ best interview talking point in the project.
 - [x] Leader election: terms, `RequestVote`, randomised election timeouts —
       `RaftNode`. Verified on a 3-node cluster: clean initial election, and
       re-election after SIGKILLing the leader mid-run, no split-brain.
-- [ ] Log replication: `AppendEntries`, commit index
-- [ ] Leader-only reads, writes acknowledged after quorum
+- [x] Log replication: `AppendEntries`, commit index — `RaftLog`, `Command`.
+      Full consistency check + truncate-on-conflict on followers; leader
+      tracks `nextIndex`/`matchIndex` per peer. `commitIndex` only advances
+      past an entry from the leader's own term (Raft §5.4.2). A dedicated
+      apply thread drives committed entries into `KeyValueStore`.
+- [x] Leader-only reads, writes acknowledged after quorum — PUT/DEL submit
+      through `RaftNode` and block for quorum commit; GET is rejected unless
+      this node believes itself leader. Known gap: that belief isn't
+      reconfirmed via a fresh heartbeat round (no read-index/lease), so a
+      partitioned leader can serve stale reads for up to one election
+      timeout after losing the cluster. Verified end to end over the real
+      client protocol on a 3-node cluster, including post-failover.
 - [ ] Chaos test: kill the leader mid-write, assert new leader elected and no
       acknowledged write lost — **this test is the point of stage 2**
 - [ ] Snapshotting for log compaction
