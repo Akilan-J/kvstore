@@ -91,8 +91,14 @@ best interview talking point in the project.
       partitioned leader can serve stale reads for up to one election
       timeout after losing the cluster. Verified end to end over the real
       client protocol on a 3-node cluster, including post-failover.
-- [ ] Chaos test: kill the leader mid-write, assert new leader elected and no
-      acknowledged write lost — **this test is the point of stage 2**
+- [x] Chaos test: kill the leader mid-write, assert new leader elected and no
+      acknowledged write lost — **this test is the point of stage 2**, and it
+      passes. `scripts/chaos_test.sh` + `kvstore.tools.ClusterWorkload`: a
+      background writer hits a 3-node cluster while the leader gets
+      SIGKILLed mid-run; the writer retries against the rest of the cluster
+      without being told a failover happened (a rejection and a dead node
+      both just mean "try the next node"). 3/3 across repeated runs, plus
+      still 8/8 on `crash_test.sh`.
 - [ ] Snapshotting for log compaction
 
 If time runs short, a working partial Raft he can explain beats a complete one he
