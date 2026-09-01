@@ -1,26 +1,37 @@
 package kvstore.raft;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
 import kvstore.store.KeyValueStore;
+import kvstore.wal.WriteAheadLog;
 
 /**
  * Raft leader election plus log replication: terms, votes, randomised
  * election timeouts, and a replicated log with a commit index.
  *
- * <p><b>Not persisted.</b> {@code currentTerm}, {@code votedFor}, and the log
- * all live in memory only. The real Raft paper requires all three on stable
- * storage before a node replies to any RPC — without that, a node that
- * restarts forgets it already voted this term and could vote again,
- * corrupting the one-vote-per-term guarantee that makes elections safe. That
- * gap is deliberately out of scope here: the stage-2 chaos test only ever
- * kills a node and leaves it dead, it never restarts one and expects it to
- * safely rejoin, so the gap doesn't affect anything this project actually
- * exercises. See CLAUDE.md's known limitations.
+ * <p><b>Persistence.</b> {@code currentTerm}, {@code votedFor}, and the log are
+ * written to {@link RaftStorage} before this node replies to any RPC that
+ * depended on them — the paper's rule, and the reason a restarted node can't
+ * vote twice in one term and hand two leaders the same term. Every write path
+ * below that touches those three calls {@code persistState()} or goes through
+ * {@link RaftLog}, which writes through to disk itself.
+ *
+ * <p>The cost is an fsync while holding {@code lock}, which stalls heartbeats
+ * and votes for its duration. That is the honest price of the guarantee: term
+ * and vote changes happen on elections rather than on writes, so it is paid
+ * rarely. {@code lastApplied} is the exception — it moves with every applied
+ * entry, so it is checkpointed every {@link #APPLY_CHECKPOINT_INTERVAL}
+ * applies instead of every one.
+ *
+ * <p>{@code commitIndex} and {@code role} are deliberately <em>not</em>
+ * persisted; the paper treats both as volatile. A restarted node comes back a
+ * follower with {@code commitIndex} 0 and relearns what is committed from the
+ * leader's next {@code AppendEntries}.
  *
  * <p><b>Concurrency.</b> {@code currentTerm}, {@code votedFor}, {@code role},
  * {@code leaderId}, the log, and the commit/apply indexes are all touched
@@ -53,10 +64,20 @@ public final class RaftNode {
     private static final long ELECTION_TIMEOUT_MAX_MILLIS = 300;
     private static final long PEER_LOOP_TICK_MILLIS = 20;
 
+    /**
+     * How many applies pass between {@code lastApplied} checkpoints. Persisting
+     * on every apply would add an fsync to every committed write; persisting
+     * rarely is safe because applies are idempotent and always replayed in log
+     * order, so a checkpoint that lags just means a bounded amount of harmless
+     * re-application after a restart.
+     */
+    private static final int APPLY_CHECKPOINT_INTERVAL = 64;
+
     private final int selfId;
     private final ClusterConfig cluster;
     private final Map<Integer, PeerClient> peerClients;
     private final KeyValueStore store;
+    private final RaftStorage storage;
     private final Random random = new Random();
 
     private final Object lock = new Object();
@@ -67,9 +88,12 @@ public final class RaftNode {
     private int votesGranted = 0;
     private long votesGrantedForTerm = -1;
 
-    private final RaftLog log = new RaftLog();
+    private final RaftLog log;
     private int commitIndex = 0;
     private int lastApplied = 0;
+    private int lastCheckpointedApplied = 0;
+    /** Index of the no-op this node appended when it last became leader; -1 if it never has. */
+    private int leaderNoopIndex = -1;
     // Leader-only; rebuilt from scratch each time this node wins an election.
     private Map<Integer, Integer> nextIndex;
     private Map<Integer, Integer> matchIndex;
@@ -77,11 +101,39 @@ public final class RaftNode {
     private volatile long electionDeadlineNanos;
     private volatile boolean running;
 
-    public RaftNode(int selfId, ClusterConfig cluster, Map<Integer, PeerClient> peerClients, KeyValueStore store) {
+    /**
+     * @param raftDir directory holding this node's {@code raft.state} and
+     *     {@code raft.log}; must not be shared with another node
+     * @param syncPolicy whether each durable write is fsync'd, mirroring the
+     *     store's own {@code --sync} flag
+     */
+    public RaftNode(int selfId, ClusterConfig cluster, Map<Integer, PeerClient> peerClients, KeyValueStore store,
+            Path raftDir, WriteAheadLog.SyncPolicy syncPolicy) throws IOException {
         this.selfId = selfId;
         this.cluster = cluster;
         this.peerClients = peerClients;
         this.store = store;
+        this.storage = new RaftStorage(raftDir, syncPolicy);
+        this.log = new RaftLog(storage);
+
+        RaftStorage.PersistentState recovered = storage.loadState();
+        this.currentTerm = recovered.currentTerm();
+        this.votedFor = recovered.votedFor();
+        // Resume applying from where the last checkpoint says we got to. It may
+        // lag behind what was actually applied, which only costs us re-applying
+        // a few entries; it can never run ahead, because the checkpoint is
+        // written after the applies it covers.
+        this.lastApplied = recovered.lastApplied();
+        this.lastCheckpointedApplied = this.lastApplied;
+        this.log.restore(storage.loadLog());
+    }
+
+    /** What recovery found on disk, for logging at startup. */
+    public String recoveredSummary() {
+        synchronized (lock) {
+            return String.format("term=%d votedFor=%s log_entries=%d last_applied=%d",
+                    currentTerm, votedFor == null ? "none" : votedFor, log.lastIndex(), lastApplied);
+        }
     }
 
     public void start() {
@@ -107,6 +159,18 @@ public final class RaftNode {
 
     public void stop() {
         running = false;
+        // Checkpoint apply progress on the way out so a graceful restart doesn't
+        // redo up to APPLY_CHECKPOINT_INTERVAL entries for no reason. Best-effort:
+        // a SIGKILL skips this entirely, which is exactly the case the
+        // apply-then-checkpoint ordering already makes safe.
+        synchronized (lock) {
+            try {
+                storage.saveState(currentTerm, votedFor, lastApplied);
+                lastCheckpointedApplied = lastApplied;
+            } catch (IOException e) {
+                System.err.printf("[node %d] final state checkpoint failed: %s%n", selfId, e.getMessage());
+            }
+        }
     }
 
     public Role role() {
@@ -124,6 +188,26 @@ public final class RaftNode {
     public Integer leaderId() {
         synchronized (lock) {
             return leaderId;
+        }
+    }
+
+    /**
+     * Whether this node may answer a read.
+     *
+     * <p>Being leader is not sufficient on its own. A freshly elected leader has
+     * a log full of entries it inherited but has not applied — {@code commitIndex}
+     * is volatile and starts at 0 after a restart — so it would answer from a
+     * state machine that is missing writes it has already promised. Waiting until
+     * the term's no-op has been applied fixes that: entries apply in index order,
+     * so once the no-op is applied everything committed before it is too.
+     *
+     * <p>This is not a full read-index implementation — leadership still isn't
+     * reconfirmed with a quorum, so the partitioned-leader window described in
+     * the README remains.
+     */
+    public boolean canServeReads() {
+        synchronized (lock) {
+            return role == Role.LEADER && leaderNoopIndex >= 0 && lastApplied >= leaderNoopIndex;
         }
     }
 
@@ -152,7 +236,13 @@ public final class RaftNode {
                 return false;
             }
             term = currentTerm;
-            index = log.append(term, command.encode());
+            try {
+                // Durable on the leader before it is replicated anywhere, so a leader
+                // that crashes and returns still has every entry it ever offered.
+                index = log.append(term, command.encode());
+            } catch (IOException e) {
+                throw new PersistenceFailure("could not persist submitted entry on node " + selfId, e);
+            }
         }
 
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
@@ -204,6 +294,9 @@ public final class RaftNode {
             votesGrantedForTerm = currentTerm;
             electionTerm = currentTerm;
             resetElectionDeadline(); // covers a split vote: this candidate must be able to retry
+            // Durable before we ask anyone for a vote: if we crash here and come
+            // back, we must remember we already spent our own vote on this term.
+            persistState();
             System.out.printf("[node %d] election timeout, starting election for term %d%n", selfId, electionTerm);
         }
         // Nothing else to do here: each peer loop notices the new term/role on its
@@ -334,6 +427,17 @@ public final class RaftNode {
     private void becomeLeader(long term) {
         role = Role.LEADER;
         leaderId = selfId;
+
+        // Raft §8: append a no-op of our own term before anything else. Entries
+        // inherited from the previous leader cannot be committed on replica count
+        // alone (§5.4.2), so without this they sit unapplied — and unreadable —
+        // until a client happens to write. Committing this no-op commits them all.
+        try {
+            leaderNoopIndex = log.append(term, Command.noop().encode());
+        } catch (IOException e) {
+            throw new PersistenceFailure("could not persist the leader's no-op entry on node " + selfId, e);
+        }
+
         nextIndex = new HashMap<>();
         matchIndex = new HashMap<>();
         for (int peerId : peerClients.keySet()) {
@@ -352,8 +456,37 @@ public final class RaftNode {
                 role = Role.FOLLOWER;
                 leaderId = null;
                 resetElectionDeadline();
+                persistState();
                 lock.notifyAll(); // wakes any submitAndAwaitCommit call that just lost its leader
             }
+        }
+    }
+
+    /**
+     * Writes term, vote, and apply progress to stable storage. Must be called
+     * with {@code lock} held, and must complete before anything observes the
+     * state it records — that ordering is the whole point.
+     *
+     * <p>A failure here is not recoverable in any useful sense: continuing would
+     * mean acting on a vote or term the disk doesn't know about, which is
+     * exactly the corruption persistence exists to prevent. Better to fail the
+     * operation loudly than to proceed unsafely.
+     */
+    private void persistState() {
+        try {
+            storage.saveState(currentTerm, votedFor, lastApplied);
+            lastCheckpointedApplied = lastApplied;
+        } catch (IOException e) {
+            throw new PersistenceFailure("could not persist Raft state for node " + selfId, e);
+        }
+    }
+
+    /** Thrown when Raft state could not be made durable; see {@link #persistState()}. */
+    static final class PersistenceFailure extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        PersistenceFailure(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -379,6 +512,9 @@ public final class RaftNode {
                 // this term's election, so give it the full timeout before we compete.
                 resetElectionDeadline();
             }
+            // Before the reply goes out, not after: a granted vote that isn't on
+            // disk is one we could forget and give away again after a restart.
+            persistState();
             return new RaftRpc.VoteReply(currentTerm, granted);
         }
     }
@@ -399,7 +535,8 @@ public final class RaftNode {
             if (term < currentTerm) {
                 return new RaftRpc.AppendReply(currentTerm, false); // stale leader
             }
-            if (term > currentTerm) {
+            boolean termChanged = term > currentTerm;
+            if (termChanged) {
                 currentTerm = term;
                 votedFor = null;
             }
@@ -409,19 +546,30 @@ public final class RaftNode {
             lock.notifyAll();
 
             if (prevLogIndex > 0 && (log.lastIndex() < prevLogIndex || log.termAt(prevLogIndex) != prevLogTerm)) {
+                if (termChanged) {
+                    persistState();
+                }
                 return new RaftRpc.AppendReply(currentTerm, false); // log doesn't match at prevLogIndex
             }
 
-            int index = prevLogIndex;
-            for (RaftLog.Entry entry : entries) {
-                index++;
-                if (log.lastIndex() >= index && log.termAt(index) != entry.term()) {
-                    log.truncateFrom(index); // conflict: existing entry disagrees, drop it and everything after
+            try {
+                int index = prevLogIndex;
+                for (RaftLog.Entry entry : entries) {
+                    index++;
+                    if (log.lastIndex() >= index && log.termAt(index) != entry.term()) {
+                        log.truncateFrom(index); // conflict: existing entry disagrees, drop it and everything after
+                    }
+                    if (log.lastIndex() < index) {
+                        log.append(entry.term(), entry.command());
+                    }
+                    // else: we already have this exact entry (term matches) — an idempotent retry, no-op
                 }
-                if (log.lastIndex() < index) {
-                    log.append(entry.term(), entry.command());
-                }
-                // else: we already have this exact entry (term matches) — an idempotent retry, no-op
+            } catch (IOException e) {
+                throw new PersistenceFailure("could not persist replicated entries on node " + selfId, e);
+            }
+
+            if (termChanged) {
+                persistState();
             }
 
             if (leaderCommit > commitIndex) {
@@ -450,12 +598,22 @@ public final class RaftNode {
             apply(toApply.command());
             synchronized (lock) {
                 lastApplied++;
+                // Checkpoint *after* the apply above, never before: that ordering is
+                // what guarantees the recorded value can only lag reality, and a
+                // lagging checkpoint just replays a few idempotent entries on restart.
+                // The reverse would skip entries that were never actually applied.
+                if (lastApplied - lastCheckpointedApplied >= APPLY_CHECKPOINT_INTERVAL) {
+                    persistState();
+                }
             }
         }
     }
 
     private void apply(byte[] commandBytes) {
         Command command = Command.decode(commandBytes);
+        if (command.type() == Command.NOOP) {
+            return; // exists only to commit inherited entries; see Command.NOOP
+        }
         try {
             if (command.type() == Command.PUT) {
                 store.put(command.key(), command.value());
