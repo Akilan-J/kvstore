@@ -19,12 +19,31 @@ record Command(byte type, String key, byte[] value) {
     static final byte PUT = 1;
     static final byte DELETE = 2;
 
+    /**
+     * A command that changes nothing, appended by a leader the moment it is
+     * elected (Raft §8).
+     *
+     * <p>It exists because of the commit rule in §5.4.2: a new leader may not
+     * mark entries from <em>previous</em> terms committed on replica count
+     * alone, so anything inherited from the last leader stays unapplied — and
+     * therefore invisible to reads — until something from the new term commits.
+     * Writing one no-op immediately supplies that something, which drags every
+     * inherited entry over the commit line with it. Without this, a cluster
+     * that has just failed over silently serves stale reads until the next
+     * client write happens along.
+     */
+    static final byte NOOP = 3;
+
     static Command put(String key, byte[] value) {
         return new Command(PUT, key, value);
     }
 
     static Command delete(String key) {
         return new Command(DELETE, key, null);
+    }
+
+    static Command noop() {
+        return new Command(NOOP, "", null);
     }
 
     byte[] encode() {

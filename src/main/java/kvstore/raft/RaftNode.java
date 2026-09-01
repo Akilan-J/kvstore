@@ -92,6 +92,8 @@ public final class RaftNode {
     private int commitIndex = 0;
     private int lastApplied = 0;
     private int lastCheckpointedApplied = 0;
+    /** Index of the no-op this node appended when it last became leader; -1 if it never has. */
+    private int leaderNoopIndex = -1;
     // Leader-only; rebuilt from scratch each time this node wins an election.
     private Map<Integer, Integer> nextIndex;
     private Map<Integer, Integer> matchIndex;
@@ -406,6 +408,16 @@ public final class RaftNode {
         role = Role.LEADER;
         leaderId = selfId;
 
+        // Raft §8: append a no-op of our own term before anything else. Entries
+        // inherited from the previous leader cannot be committed on replica count
+        // alone (§5.4.2), so without this they sit unapplied — and unreadable —
+        // until a client happens to write. Committing this no-op commits them all.
+        try {
+            leaderNoopIndex = log.append(term, Command.noop().encode());
+        } catch (IOException e) {
+            throw new PersistenceFailure("could not persist the leader's no-op entry on node " + selfId, e);
+        }
+
         nextIndex = new HashMap<>();
         matchIndex = new HashMap<>();
         for (int peerId : peerClients.keySet()) {
@@ -579,6 +591,9 @@ public final class RaftNode {
 
     private void apply(byte[] commandBytes) {
         Command command = Command.decode(commandBytes);
+        if (command.type() == Command.NOOP) {
+            return; // exists only to commit inherited entries; see Command.NOOP
+        }
         try {
             if (command.type() == Command.PUT) {
                 store.put(command.key(), command.value());
