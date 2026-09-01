@@ -4,8 +4,15 @@ A persistent key-value store written in Java with no external dependencies. Data
 lives in memory for fast lookups and is made durable by a write-ahead log that is
 replayed on startup, so the store survives process crashes without data loss.
 
-**Stage 1 of 2.** This is the single-node storage engine. Raft replication and
-leader failover are the next stage — see [Roadmap](#roadmap).
+It also replicates. Point it at two peers and it runs as a Raft cluster: leader
+election, log replication, quorum-acknowledged writes, and automatic failover
+when the leader dies. Replication is opt-in — omit the cluster flags and it is
+exactly the single-node store described above.
+
+**Status.** Stage 1 (durable single node) and stage 2 (Raft replication) are
+both implemented and tested. Log compaction via snapshotting is the one planned
+item still outstanding — see [Roadmap](#roadmap) for that and for the
+simplifications that were made deliberately.
 
 ---
 
@@ -34,18 +41,31 @@ The two invariants that make it work:
 
 ## Architecture
 
+One node. Client traffic enters on the left; when replication is enabled, a
+write detours through Raft before it is applied.
+
 ```
-              TCP :7379
-                  │
-         ┌────────▼────────┐
-         │  KVServer       │  accept loop + bounded worker pool
-         └────────┬────────┘
-                  │ one worker per connection
-      ┌───────────▼───────────┐
-      │  ConnectionHandler    │  parses the wire protocol
-      └───────────┬───────────┘
-                  │
-      ┌───────────▼───────────────────────────────┐
+              TCP :7379  (clients)          TCP :8379  (peers)
+                  │                              │
+         ┌────────▼────────┐            ┌────────▼─────────┐
+         │  KVServer       │            │  PeerServer      │
+         └────────┬────────┘            └────────┬─────────┘
+                  │ one worker per conn          │ one worker per peer
+      ┌───────────▼───────────┐        ┌─────────▼──────────────┐
+      │  ConnectionHandler    │        │ PeerConnectionHandler  │
+      └───────────┬───────────┘        └─────────┬──────────────┘
+                  │                              │ RequestVote,
+       PUT/DEL    │  GET                         │ AppendEntries
+                  │                              │
+      ┌───────────▼──────────────────────────────▼───────────┐
+      │  RaftNode    term · votedFor · role · log            │
+      │              commitIndex · nextIndex / matchIndex    │
+      │  ┌────────────────────────────────────────────────┐  │
+      │  │ apply thread: committed entries, in order      │  │
+      │  └──────────────────────┬─────────────────────────┘  │
+      └─────────────────────────┼────────────────────────────┘
+                                │
+      ┌─────────────────────────▼─────────────────┐
       │  KeyValueStore                            │
       │  ┌─────────────────────┐                  │
       │  │ ConcurrentHashMap   │  ← lock-free reads
@@ -61,6 +81,10 @@ The two invariants that make it work:
               kvstore.wal on disk
 ```
 
+Client and peer traffic sit on **separate ports** on purpose: the client wire
+protocol never has to reason about Raft messages, and a change to one protocol
+cannot accidentally break the other.
+
 | Component | Responsibility |
 | --- | --- |
 | `wal/WriteAheadLog` | Record encoding, CRC verification, replay, torn-tail truncation |
@@ -69,8 +93,15 @@ The two invariants that make it work:
 | `net/KVClient` | Client library used by the tools |
 | `server/KVServer` | Listen socket, worker pool, lifecycle |
 | `server/ConnectionHandler` | Command dispatch, one connection at a time |
+| `raft/RaftNode` | Terms, votes, roles, the replicated log, commit index, apply loop |
+| `raft/RaftLog` | The log itself: term-tagged entries, conflict truncation |
+| `raft/Command` | Encoding of a replicated PUT/DEL |
+| `raft/ClusterConfig` | Static membership, quorum arithmetic |
+| `raft/PeerServer` · `PeerConnectionHandler` | Inbound peer RPCs |
+| `raft/PeerClient` | Outbound peer RPCs, reconnecting on failure |
 | `tools/Bench` | Closed-loop load generator with latency percentiles |
 | `tools/Workload` | Deterministic write/verify used by the crash tests |
+| `tools/ClusterWorkload` | Same, but retries across a cluster; used by the chaos test |
 
 ---
 
@@ -93,6 +124,75 @@ Replay stops at the first record that is short, has a nonsensical length, or fai
 its CRC, then truncates the file to the last known-good offset. The log is
 therefore always left in a state where every record it contains is complete — a
 partial write costs you that one write, never the file.
+
+---
+
+## Replication
+
+Three nodes, one leader. The leader is the only node that accepts writes; it
+appends each one to the replicated log, ships it to the followers, and does not
+acknowledge the client until a **majority** has stored it. A write that has been
+acknowledged has therefore survived onto at least two of three machines, which is
+what lets the cluster lose one and keep every acknowledged write.
+
+**Leader election.** Every node runs a randomised 150–300 ms election timer. A
+follower that hears nothing from a leader in that window bumps its term and
+becomes a candidate. Randomising the timeout is what breaks symmetry: without it
+all three nodes would time out together, split the vote, and repeat. The leader
+suppresses those timers by sending heartbeats every 50 ms — comfortably inside
+the minimum timeout, so a healthy leader is never mistaken for a dead one.
+
+**Log matching.** `AppendEntries` carries the index and term of the entry
+immediately preceding the ones being sent. A follower that doesn't have a
+matching entry there rejects the request, and the leader retries one index
+further back until they agree, then overwrites whatever diverged. This is what
+guarantees that two logs agreeing at some index agree on everything before it.
+
+Two rules from the Raft paper carry most of the safety weight, and both are
+implemented:
+
+1. **Election restriction (§5.4.1).** A vote is only granted to a candidate whose
+   log is at least as up to date as the voter's. Without it, a node with a short
+   log could win an election and then truncate entries that were already
+   committed elsewhere — silent data loss, not merely a stale replica.
+2. **No committing prior terms directly (§5.4.2).** A new leader inherits entries
+   from previous terms but may not mark them committed on replica count alone; it
+   must first commit an entry of its own term. Skipping this lets an entry that
+   looks safely replicated be overwritten later.
+
+Committed entries are handed to a **dedicated apply thread** rather than being
+applied inline. Applying means calling into `KeyValueStore`, which does disk I/O,
+and that should never block heartbeat or vote traffic — a leader stalled on an
+fsync would start losing elections it should win.
+
+**Concurrency.** All Raft state — term, vote, role, log, commit index — is
+guarded by one lock, for the same reason `KeyValueStore` serialises writes: so
+that two RequestVote RPCs arriving on different connections cannot both be
+granted in the same term. Outbound traffic uses one long-lived thread per peer,
+each owning its own connection, which is what keeps that connection single-owner
+and lock-free.
+
+### What is deliberately simplified
+
+Written down honestly rather than papered over:
+
+- **Raft state is in memory only.** The paper requires term, vote, and log on
+  stable storage before replying to any RPC. A node that restarts here comes back
+  with no history, so it could vote twice in one term. The chaos test kills nodes
+  and leaves them dead, so it never exercises this — but it is a real gap, not a
+  cosmetic one, and it is the next thing being built.
+- **Reads trust local role.** `GET` is refused unless the node believes it is
+  leader, but that belief is not reconfirmed against a quorum. A leader isolated
+  by a partition can keep serving reads for up to one election timeout after the
+  cluster has replaced it. Real Raft closes this with a read-index round or a
+  leader lease; neither is here yet.
+- **Membership is fixed at startup.** No joint consensus, no adding or removing
+  nodes at runtime.
+- **`DEL` always reports `:1` once committed.** Whether the key actually existed
+  is not threaded back from the apply loop, unlike the single-node path.
+- **Backtracking is one index at a time.** The paper's optional
+  skip-by-term optimisation is not implemented; at this scale a follower catches
+  up in a handful of heartbeats regardless.
 
 ---
 
@@ -122,9 +222,26 @@ $5
 hello
 ```
 
+**In cluster mode the protocol is unchanged, but only the leader answers.** Every
+command above behaves identically on the leader. On a follower, `GET`, `PUT`, and
+`DEL` are all refused with a pointer to the current leader, so a client can find
+its way with no separate discovery mechanism:
+
+```
+$ printf 'GET greeting\r\n' | nc 127.0.0.1 7379
+-ERR not leader (leader is node 3)
+```
+
+`PUT` and `DEL` on the leader block until the write is committed by a majority,
+so `+OK` means replicated, not merely accepted. If the leader dies mid-write the
+client sees an error rather than a false acknowledgement, and can retry against
+another node — which is exactly what `ClusterWorkload` does.
+
 ---
 
 ## Running it
+
+### Single node
 
 ```bash
 ./scripts/build.sh
@@ -133,10 +250,32 @@ java -cp build kvstore.Main --port 7379 --data data/kvstore.wal --sync every
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--port` | `7379` | Listen port |
+| `--port` | `7379` | Client listen port |
 | `--threads` | `32` | Worker pool size |
 | `--data` | `data/kvstore.wal` | Log file path |
 | `--sync` | `every` | `every` fsyncs each write; `never` leaves it to the OS |
+| `--id` | *(unset)* | This node's Raft id. **Omitting it disables replication entirely** |
+| `--raft-port` | `--port` + 1000 | Peer RPC listen port |
+| `--peers` | *(empty)* | The other nodes: `id=host:port,id=host:port` |
+
+### Three-node cluster
+
+Each node needs its own client port, peer port, data file, and the peer list of
+the *other* two. From three terminals:
+
+```bash
+java -cp build kvstore.Main --port 7379 --data data/n1.wal \
+    --id 1 --raft-port 8379 --peers "2=127.0.0.1:8380,3=127.0.0.1:8381"
+
+java -cp build kvstore.Main --port 7380 --data data/n2.wal \
+    --id 2 --raft-port 8380 --peers "1=127.0.0.1:8379,3=127.0.0.1:8381"
+
+java -cp build kvstore.Main --port 7381 --data data/n3.wal \
+    --id 3 --raft-port 8381 --peers "1=127.0.0.1:8379,2=127.0.0.1:8380"
+```
+
+Within a few hundred milliseconds one node logs `elected leader for term 1`.
+Write to that node's client port; the other two will redirect you to it.
 
 ---
 
@@ -168,6 +307,40 @@ Result on the reference run:
 
 8 passed, 0 failed
 ```
+
+---
+
+## Chaos test
+
+```bash
+./scripts/chaos_test.sh
+```
+
+The durability tests above prove one node doesn't lose data. This proves the
+*cluster* doesn't lose data when a node dies at the worst possible moment.
+
+A background writer hammers a 3-node cluster while the current leader is
+`SIGKILL`ed mid-run. The writer is not told that a failover happened — it simply
+retries against the next node whenever one rejects it or stops answering, since
+from a client's point of view "not the leader" and "dead" both just mean *try
+someone else*. Three assertions: the writer finishes every write, a surviving
+node takes over, and every key is still there afterwards with the right value.
+
+```
+[1] Kill the leader mid-write; assert failover and zero data loss
+  initial leader: node 3
+  SIGKILLed leader node 3 mid-write
+  PASS: writer finished all 300 writes despite the leader dying mid-run
+  PASS: a surviving node was elected leader after the kill
+  verified 300 keys: 0 missing, 0 mismatched
+  PASS: every acknowledged write is present after the failover
+
+3 passed, 0 failed
+```
+
+The kill is `SIGKILL` for the same reason it is in the durability tests: no
+shutdown hook runs, so the leader gets no chance to hand off gracefully. That is
+what an actual machine failure looks like.
 
 ---
 
@@ -203,21 +376,32 @@ matters here: a slow flush stalls one request badly while the rest look fine.
 
 ## Roadmap
 
-Stage 2 turns this into a replicated store:
+Stage 1 — durable single node:
 
-- [ ] Static 3-node cluster membership and a peer RPC channel
-- [ ] Raft leader election (terms, `RequestVote`, randomised election timeouts)
-- [ ] Log replication with `AppendEntries` and a commit index
-- [ ] Reads served only by the leader, writes acknowledged after a quorum
-- [ ] Chaos test: kill the leader mid-write, assert a new leader is elected and
+- [x] Write-ahead log with per-record CRCs and torn-tail truncation
+- [x] Crash tests covering `SIGKILL`, tombstones, corruption, and torn writes
+- [x] Benchmarks quantifying the fsync tradeoff
+
+Stage 2 — Raft replication:
+
+- [x] Static 3-node cluster membership and a peer RPC channel
+- [x] Raft leader election (terms, `RequestVote`, randomised election timeouts)
+- [x] Log replication with `AppendEntries` and a commit index
+- [x] Reads served only by the leader, writes acknowledged after a quorum
+- [x] Chaos test: kill the leader mid-write, assert a new leader is elected and
       no acknowledged write is lost
 - [ ] Log compaction via snapshotting, so replay time stops growing forever
 
-Known limitations of stage 1, all addressed by the items above or listed honestly
-as out of scope:
+Next up:
 
+- [ ] Persist term, vote, and log to disk so a restarted node can safely rejoin
+- [ ] Read-index or leader lease, closing the stale-read window described above
+
+Remaining limitations, listed honestly rather than hidden:
+
+- The Raft log lives in memory; a restarted node rejoins with no history.
 - The log grows without bound; there is no compaction yet.
 - The whole dataset must fit in memory.
-- No replication, so the node is a single point of failure.
+- Cluster membership is fixed at startup.
 - No authentication or TLS; bind to localhost.
 - One lock for all writes, so write throughput will not scale past a few cores.
