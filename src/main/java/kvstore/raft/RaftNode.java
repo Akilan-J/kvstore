@@ -191,6 +191,26 @@ public final class RaftNode {
         }
     }
 
+    /**
+     * Whether this node may answer a read.
+     *
+     * <p>Being leader is not sufficient on its own. A freshly elected leader has
+     * a log full of entries it inherited but has not applied — {@code commitIndex}
+     * is volatile and starts at 0 after a restart — so it would answer from a
+     * state machine that is missing writes it has already promised. Waiting until
+     * the term's no-op has been applied fixes that: entries apply in index order,
+     * so once the no-op is applied everything committed before it is too.
+     *
+     * <p>This is not a full read-index implementation — leadership still isn't
+     * reconfirmed with a quorum, so the partitioned-leader window described in
+     * the README remains.
+     */
+    public boolean canServeReads() {
+        synchronized (lock) {
+            return role == Role.LEADER && leaderNoopIndex >= 0 && lastApplied >= leaderNoopIndex;
+        }
+    }
+
     /** Leader-only: replicates a PUT and blocks until it commits or the timeout elapses. */
     public boolean submitPut(String key, byte[] value, long timeoutMillis) throws InterruptedException {
         return submitAndAwaitCommit(Command.put(key, value), timeoutMillis);

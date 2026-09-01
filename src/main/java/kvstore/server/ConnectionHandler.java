@@ -116,8 +116,15 @@ final class ConnectionHandler implements Runnable {
             writeError(out, "usage: GET <key>");
             return;
         }
-        if (raftNode != null && raftNode.role() != RaftNode.Role.LEADER) {
-            writeError(out, "not leader (" + leaderHint() + ")");
+        if (raftNode != null && !raftNode.canServeReads()) {
+            if (raftNode.role() == RaftNode.Role.LEADER) {
+                // Leader, but hasn't finished applying what it inherited. Answering
+                // now could miss an already-acknowledged write, so refuse and let
+                // the client retry a moment later.
+                writeError(out, "leader is still catching up; retry");
+            } else {
+                writeError(out, "not leader (" + leaderHint() + ")");
+            }
             return;
         }
         byte[] value = store.get(parts[1]);
