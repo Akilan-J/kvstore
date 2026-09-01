@@ -26,6 +26,7 @@ public final class Main {
         Integer raftId = null; // null means Raft is disabled: plain stage-1 node
         int raftPort = -1;
         String peersArg = "";
+        Path raftDir = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -40,6 +41,7 @@ public final class Main {
                 case "--id" -> raftId = Integer.parseInt(args[++i]);
                 case "--raft-port" -> raftPort = Integer.parseInt(args[++i]);
                 case "--peers" -> peersArg = args[++i];
+                case "--raft-dir" -> raftDir = Paths.get(args[++i]);
                 case "--help" -> {
                     printUsage();
                     return;
@@ -76,7 +78,13 @@ public final class Main {
                 // peer can't stall the loop that's supposed to be detecting it as dead.
                 peerClients.put(e.getKey(), new PeerClient(e.getValue(), 100));
             }
-            raftNode = new RaftNode(raftId, cluster, peerClients, store);
+            if (raftDir == null) {
+                // Default beside the store's own log, so one --data path is enough to
+                // give a node everything it owns on disk.
+                Path parent = dataFile.toAbsolutePath().getParent();
+                raftDir = (parent == null ? Paths.get(".") : parent).resolve("raft");
+            }
+            raftNode = new RaftNode(raftId, cluster, peerClients, store, raftDir, sync);
         }
 
         // KVServer needs raftNode (possibly null) at construction, so it's built
@@ -91,9 +99,10 @@ public final class Main {
             // never service them, since no thread exists to run the handlers.
             peerServer = new PeerServer(raftPort, Math.max(1, cluster.peers().size()), raftNode);
             peerServer.start();
+            System.out.printf("raft node id=%d cluster_size=%d peer_port=%d dir=%s%n",
+                    raftId, cluster.clusterSize(), peerServer.port(), raftDir);
+            System.out.printf("raft recovered %s%n", raftNode.recoveredSummary());
             raftNode.start();
-            System.out.printf("raft node id=%d cluster_size=%d peer_port=%d%n",
-                    raftId, cluster.clusterSize(), peerServer.port());
         }
 
         PeerServer finalPeerServer = peerServer;
@@ -130,6 +139,7 @@ public final class Main {
                   --id <n>            this node's Raft id; enables the Raft peer listener (default: disabled)
                   --raft-port <n>     peer RPC listen port (default: client port + 1000)
                   --peers <list>      other nodes' peer ports: id=host:port,id=host:port,...
+                  --raft-dir <path>   directory for raft.state and raft.log (default: <data dir>/raft)
                 """);
     }
 }
